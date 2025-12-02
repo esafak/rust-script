@@ -4,12 +4,16 @@ on:
   push:
     tags:
       - '[0-9]+.*'
+  workflow_dispatch:
 
 jobs:
   create-release:
     name: "Create GitHub release"
     # only publish from the origin repository
-    if: github.repository_owner == 'fornwall'
+    if: |
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/') &&
+      github.repository_owner == 'fornwall'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -20,6 +24,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   crates:
+    if: |
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/') &&
+      github.repository_owner == 'fornwall'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -28,24 +36,30 @@ jobs:
           cargo package
           cargo publish --token ${{ secrets.CARGO_TOKEN }}
 
-  binaries:
+  binaries-release:
     name: "Upload release binaries"
+    if: |
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/') &&
+      github.repository_owner == 'fornwall'
     needs:
       - create-release
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-gnu.2.28
             os: ubuntu-latest
+            build-tool: cargo-zigbuild
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
           - target: x86_64-apple-darwin
             os: macos-latest
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu.2.28
             os: ubuntu-latest
+            build-tool: cargo-zigbuild
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
           - target: aarch64-apple-darwin
@@ -60,5 +74,117 @@ jobs:
         with:
           bin: rust-script
           target: ${{ matrix.target }}
+          build-tool: ${{ matrix.build-tool }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  binaries-test:
+    name: "Build test binaries"
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu.2.28
+            os: ubuntu-latest
+            build-tool: cargo-zigbuild
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-unknown-linux-gnu.2.28
+            os: ubuntu-latest
+            build-tool: cargo-zigbuild
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: universal-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-zigbuild
+        if: matrix.build-tool == 'cargo-zigbuild'
+        run: pip install ziglang cargo-zigbuild
+
+      - name: Add target for zigbuild
+        if: matrix.build-tool == 'cargo-zigbuild'
+        run: |
+          # For targets like x86_64-unknown-linux-gnu.2.28, add the base target
+          TARGET_BASE=$(echo "${{ matrix.target }}" | sed 's/\.[0-9.]*$//')
+          rustup target add $TARGET_BASE
+
+      - name: Install cross
+        if: (contains(matrix.target, 'aarch64') && runner.os == 'Linux') || contains(matrix.target, 'musl')
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Add target for cargo
+        if: matrix.build-tool != 'cargo-zigbuild' && matrix.target != 'universal-apple-darwin' && !((contains(matrix.target, 'aarch64') && runner.os == 'Linux') || contains(matrix.target, 'musl'))
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build with cargo-zigbuild
+        if: matrix.build-tool == 'cargo-zigbuild'
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+
+      - name: Build with cross
+        if: ((contains(matrix.target, 'aarch64') && runner.os == 'Linux') || contains(matrix.target, 'musl')) && matrix.build-tool != 'cargo-zigbuild'
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build with cargo
+        if: matrix.build-tool != 'cargo-zigbuild' && matrix.target != 'universal-apple-darwin' && !((contains(matrix.target, 'aarch64') && runner.os == 'Linux') || contains(matrix.target, 'musl'))
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build universal macOS binary
+        if: matrix.target == 'universal-apple-darwin'
+        run: |
+          rustup target add x86_64-apple-darwin
+          rustup target add aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+          mkdir -p target/universal-apple-darwin/release
+          lipo -create \
+            target/x86_64-apple-darwin/release/rust-script \
+            target/aarch64-apple-darwin/release/rust-script \
+            -output target/universal-apple-darwin/release/rust-script
+
+      - name: Determine binary path
+        id: binary-path
+        shell: bash
+        run: |
+          if [[ "${{ matrix.build-tool }}" == "cargo-zigbuild" ]]; then
+            # zigbuild uses the target without the glibc version suffix
+            TARGET_BASE=$(echo "${{ matrix.target }}" | sed 's/\.[0-9.]*$//')
+            echo "path=target/${TARGET_BASE}/release" >> $GITHUB_OUTPUT
+          else
+            echo "path=target/${{ matrix.target }}/release" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload Linux artifact
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v5
+        with:
+          name: rust-script-${{ matrix.target }}
+          path: ${{ steps.binary-path.outputs.path }}/rust-script
+          if-no-files-found: error
+
+      - name: Upload macOS artifact
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v5
+        with:
+          name: rust-script-${{ matrix.target }}
+          path: ${{ steps.binary-path.outputs.path }}/rust-script
+          if-no-files-found: error
+
+      - name: Upload Windows artifact
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v5
+        with:
+          name: rust-script-${{ matrix.target }}
+          path: ${{ steps.binary-path.outputs.path }}/rust-script.exe
+          if-no-files-found: error
